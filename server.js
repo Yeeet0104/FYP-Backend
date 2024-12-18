@@ -8,6 +8,7 @@ const FormData = require("form-data");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const secret = process.env.JWT_SECRET; // Ensure you set this in your environment variables
+const refreshSecret = process.env.JWT_REFRESH_SECRET; // Secret key for refresh tokens
 
 const app = express();
 // Enable CORS for all routes
@@ -33,7 +34,6 @@ function authenticateToken(req, res, next) {
     next();
   });
 }
-
 
 const connection = mysql.createConnection({
   host: process.env.DB_HOST,
@@ -108,176 +108,310 @@ app.post("/evaluate", upload.single("audio"), async (req, res) => {
   }
 });
 
-app.post("/mock-interview", authenticateToken, upload.single("audio"), async (req, res) => {
-  const { type, difficulty } = req.body; // Extract difficulty level
-  const audioFile = req.file; // Uploaded audio file
-  const userId = req.user.userId;
+app.post(
+  "/mock-interview",
+  authenticateToken,
+  upload.single("audio"),
+  async (req, res) => {
+    const { type, difficulty, conversationId } = req.body; // Extract conversationId
+    const audioFile = req.file;
+    const userId = req.user.userId;
+
+    try {
+      console.log("Fetching conversation history...");
+      let formattedHistory = "";
+
+      if (conversationId) {
+        // Fetch history for the existing conversation
+        const [history] = await connection.promise().query(
+          `SELECT user_message, bot_response 
+             FROM conversation_history 
+             WHERE user_id = ? AND conversation_id = ? ORDER BY timestamp ASC`,
+          [userId, conversationId]
+        );
+
+        formattedHistory = history
+          .map(
+            (entry) => `User: ${entry.user_message}\nBot: ${entry.bot_response}`
+          )
+          .join("\n");
+      }
+
+      console.log("Sending request to Python backend...");
+
+      // Prepare formData for audio, history, and difficulty
+      const formData = new FormData();
+      formData.append("type", type);
+      formData.append("difficulty", difficulty); // Include difficulty level
+      formData.append("audio", audioFile.buffer, audioFile.originalname);
+      formData.append("history", formattedHistory);
+
+      // Send request to Python backend
+      const response = await axios.post(
+        "http://localhost:8000/mock-interview",
+        formData,
+        {
+          headers: { ...formData.getHeaders() },
+        }
+      );
+
+      // Log Python API response
+      const data = response.data;
+      console.log("Response from Python API:", data);
+
+      // Validate required fields
+      if (!data.transcription || !data.feedback || !data.follow_up_question) {
+        console.warn("Missing required fields:", {
+          transcription: data.transcription,
+          feedback: data.feedback,
+          follow_up_question: data.follow_up_question,
+        });
+      }
+
+      // Insert into conversation history if valid
+      const newConversationId = conversationId || Date.now();
+      if (data.transcription && data.feedback && data.follow_up_question) {
+        await connection.promise().query(
+          `INSERT INTO conversation_history 
+              (user_id, conversation_id, user_message, bot_response, feedback, timestamp) 
+           VALUES (?, ?, ?, ?, ?, NOW())`,
+          [
+            userId,
+            newConversationId,
+            data.transcription,
+            data.follow_up_question,
+            data.feedback, // Add feedback content
+          ]
+        );
+      }
+
+      // Send back to the client
+      res.json(data);
+    } catch (error) {
+      console.error(
+        "Error in /mock-interview:",
+        error.message || error.response.data
+      );
+      res.status(500).json({ error: "Failed to process the interview." });
+    }
+  }
+);
+
+app.get("/get-audio/:filename", async (req, res) => {
+  const { filename } = req.params;
 
   try {
-    console.log("Fetching conversation history...");
-    // Fetch conversation history from the database
-    const [history] = await connection.promise().query(
-      `SELECT user_message, bot_response FROM conversation_history 
-       WHERE user_id = ? ORDER BY timestamp ASC`,
-      [userId]
+    // Call the Python FastAPI backend to get the audio
+    const response = await axios.get(
+      `http://localhost:8000/get-audio/${filename}`,
+      {
+        responseType: "stream", // Important: Ensure the response is treated as a stream
+      }
     );
 
-    // Format the history for the Python backend
-    const formattedHistory = history
-      .map((entry) => `User: ${entry.user_message}\nBot: ${entry.bot_response}`)
-      .join("\n");
-
-    console.log("Sending request to Python backend...");
-
-    // Prepare formData for audio, history, and difficulty
-    const formData = new FormData();
-    formData.append("type", type);
-    formData.append("difficulty", difficulty); // Include difficulty level
-    formData.append("audio", audioFile.buffer, audioFile.originalname);
-    formData.append("history", formattedHistory);
-
-    // Send request to Python backend
-    const response = await axios.post("http://localhost:8000/mock-interview", formData, {
-      headers: { ...formData.getHeaders() },
-    });
-
-    // Log Python API response
-    const data = response.data;
-    console.log("Response from Python API:", data);
-
-    // Validate required fields
-    if (!data.transcription || !data.feedback || !data.follow_up_question) {
-      console.warn("Missing required fields:", {
-        transcription: data.transcription,
-        feedback: data.feedback,
-        follow_up_question: data.follow_up_question,
-      });
-    }
-
-    // Insert into conversation history if valid
-    const conversationId = Date.now(); // Generate a unique ID for the conversation
-    if (data.transcription && data.feedback && data.follow_up_question) {
-      await connection.promise().query(
-        `INSERT INTO conversation_history (user_id, conversation_id, user_message, bot_response, timestamp) 
-         VALUES (?, ?, ?, ?, NOW())`,
-        [userId, conversationId, data.transcription, data.follow_up_question]
-      );
-    }
-
-    // Send back to the client
-    res.json(data);
+    // Forward the audio stream back to the frontend
+    res.setHeader("Content-Type", "audio/wav");
+    response.data.pipe(res);
   } catch (error) {
-    console.error("Error in /mock-interview:", error.message || error.response.data);
-    res.status(500).json({ error: "Failed to process the interview." });
+    console.error("Error fetching audio:", error.message);
+    res.status(500).json({ error: "Failed to fetch audio file." });
   }
 });
 
-
-
-
-
 // login , register and get all users
 // User Registration
-app.post('/register', async (req, res) => {
+app.post("/register", async (req, res) => {
   const { username, email, password } = req.body;
 
   if (!username || !email || !password) {
-    return res.status(400).json({ error: 'Username, email, and password are required.' });
+    return res
+      .status(400)
+      .json({ error: "Username, email, and password are required." });
   }
 
   const hashedPassword = await bcrypt.hash(password, 10);
 
   connection.query(
-    'INSERT INTO users (username, email, password) VALUES (?, ?, ?)',
+    "INSERT INTO users (username, email, password) VALUES (?, ?, ?)",
     [username, email, hashedPassword],
     (err) => {
       if (err) {
-        if (err.code === 'ER_DUP_ENTRY') {
-          return res.status(400).json({ error: 'Username or email already exists.' });
+        if (err.code === "ER_DUP_ENTRY") {
+          return res
+            .status(400)
+            .json({ error: "Username or email already exists." });
         }
-        console.error('Error during user registration:', err);
-        return res.status(500).json({ error: 'User registration failed' });
+        console.error("Error during user registration:", err);
+        return res.status(500).json({ error: "User registration failed" });
       }
-      res.json({ message: 'User registered successfully' });
+      res.json({ message: "User registered successfully" });
     }
   );
 });
-
-
+// Helper function to generate tokens
+function generateTokens(userId) {
+  const accessToken = jwt.sign({ userId }, secret, { expiresIn: "30m" }); // Short-lived access token
+  const refreshToken = jwt.sign({ userId }, refreshSecret, { expiresIn: "7d" }); // Longer-lived refresh token
+  return { accessToken, refreshToken };
+}
 // User Login
-app.post('/login', (req, res) => {
+app.post("/login", (req, res) => {
   const { username, password } = req.body;
 
   if (!username || !password) {
-    return res.status(400).json({ error: 'Username/email and password are required.' });
+    return res
+      .status(400)
+      .json({ error: "Username/email and password are required." });
   }
 
   // Check if the provided value is an email or a username
-  const query = username.includes('@')
-    ? 'SELECT * FROM users WHERE email = ?'
-    : 'SELECT * FROM users WHERE username = ?';
+  const query = username.includes("@")
+    ? "SELECT * FROM users WHERE email = ?"
+    : "SELECT * FROM users WHERE username = ?";
 
   connection.query(query, [username], async (err, results) => {
     if (err || results.length === 0) {
-      return res.status(401).json({ error: 'Invalid credentials.' });
+      return res.status(401).json({ error: "Invalid credentials." });
     }
 
     const user = results[0];
     const isMatch = await bcrypt.compare(password, user.password);
 
     if (!isMatch) {
-      return res.status(401).json({ error: 'Invalid credentials.' });
+      return res.status(401).json({ error: "Invalid credentials." });
     }
 
-    const token = jwt.sign({ userId: user.id }, secret, { expiresIn: '1h' });
-    res.json({ token });
+    const payload = { userId: user.id };
+    const accessToken = jwt.sign(payload, secret, { expiresIn: "30m" });
+    const refreshToken = jwt.sign(payload, secret, { expiresIn: "7d" });
+
+    // Store refresh token in the database (or cache)
+    connection.query(
+      "UPDATE users SET refresh_token = ? WHERE id = ?",
+      [refreshToken, user.id],
+      (err) => {
+        if (err) console.error("Error storing refresh token:", err);
+      }
+    );
+
+    // Send tokens
+    res.json({
+      accessToken,
+      refreshToken, // Ideally, send this in HttpOnly cookie
+    });
   });
 });
+app.post("/refresh-token", (req, res) => {
+  const { refreshToken } = req.body;
 
-app.post("/generate-script", authenticateToken, async (req, res) => {
-  const { tone} = req.body;
-  console.log("Tone:", tone);
-  if (!tone ) {
-    return res.status(400).json({ error: "Tone and setting are required." });
+  if (!refreshToken) {
+    return res.status(401).json({ error: "Refresh token is required." });
   }
 
-  try {
-    const response = await axios.post("http://localhost:8000/generate-script", { tone });
-    res.json(response.data);
-  } catch (error) {
-    console.error("Error from Python API:", error.response?.data || error.message);
-    res.status(500).json({ error: "Failed to generate script." });
-  }
-});
-
-app.post('/store-history', authenticateToken, async (req, res) => {
-  const { userId } = req.user;
-  const { conversationId, userMessage, botResponse } = req.body;
-
-  if (!conversationId || !userMessage || !botResponse) {
-    console.error('Missing required fields:', req.body);
-    return res.status(400).json({ error: 'All fields are required.' });
-  }
-
+  // Find the user by the refresh token
   connection.query(
-    'INSERT INTO conversation_history (user_id, conversation_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
-    [userId, conversationId, userMessage, botResponse],
-    (err) => {
-      if (err) {
-        console.error('Error storing history:', err);
-        return res.status(500).json({ error: 'Failed to store history.' });
+    "SELECT * FROM users WHERE refresh_token = ?",
+    [refreshToken],
+    (err, results) => {
+      if (err || results.length === 0) {
+        return res.status(403).json({ error: "Invalid or expired refresh token." });
       }
-      res.json({ message: 'History stored successfully.' });
+
+      const user = results[0];
+      jwt.verify(refreshToken, secret, (err) => {
+        if (err) {
+          return res.status(403).json({ error: "Invalid or expired refresh token." });
+        }
+
+        // Generate a new access token
+        const newAccessToken = jwt.sign({ userId: user.id }, secret, { expiresIn: "30m" });
+        res.json({ accessToken: newAccessToken });
+      });
     }
   );
 });
 
-app.get('/fetch-history', authenticateToken, (req, res) => {
+
+app.post("/logout", authenticateToken, (req, res) => {
+  const { userId } = req.user;
+
+  connection.query(
+    "UPDATE users SET refresh_token = NULL WHERE id = ?",
+    [userId],
+    (err) => {
+      if (err) {
+        console.error("Error revoking refresh token:", err);
+        return res.status(500).json({ error: "Failed to log out." });
+      }
+      res.json({ message: "Logged out successfully." });
+    }
+  );
+});
+
+app.post(
+  "/generate-script",
+  authenticateToken,
+  upload.none(),
+  async (req, res) => {
+    const { tone } = req.body;
+    console.log("Tone:", req.body);
+    console.log("Tone2:", req);
+    console.log("Tone3:", tone);
+    if (!tone) {
+      return res.status(400).json({ error: "Tone and setting are required." });
+    }
+
+    try {
+      // Forward the 'tone' to FastAPI backend
+      const formData = new FormData();
+      formData.append("tone", tone);
+
+      const response = await axios.post(
+        "http://localhost:8000/generate-script",
+        formData,
+        {
+          headers: formData.getHeaders(),
+        }
+      );
+      res.json(response.data);
+    } catch (error) {
+      console.error(
+        "Error from Python API:",
+        error.response?.data || error.message
+      );
+      res.status(500).json({ error: "Failed to generate script." });
+    }
+  }
+);
+
+app.post("/store-history", authenticateToken, async (req, res) => {
+  const { userId } = req.user;
+  const { conversationId, userMessage, botResponse } = req.body;
+
+  if (!conversationId || !userMessage || !botResponse) {
+    console.error("Missing required fields:", req.body);
+    return res.status(400).json({ error: "All fields are required." });
+  }
+
+  connection.query(
+    "INSERT INTO conversation_history (user_id, conversation_id, user_message, bot_response) VALUES (?, ?, ?, ?)",
+    [userId, conversationId, userMessage, botResponse],
+    (err) => {
+      if (err) {
+        console.error("Error storing history:", err);
+        return res.status(500).json({ error: "Failed to store history." });
+      }
+      res.json({ message: "History stored successfully." });
+    }
+  );
+});
+
+app.get("/fetch-history", authenticateToken, (req, res) => {
   const { userId } = req.user;
   const { conversationId } = req.query; // Fetch conversation_id from query params
 
   let query = `
-    SELECT conversation_id, user_message, bot_response, timestamp
+    SELECT conversation_id, user_message, bot_response, timestamp ,feedback
     FROM conversation_history
     WHERE user_id = ?
       AND timestamp >= NOW() - INTERVAL 15 DAY
@@ -300,16 +434,13 @@ app.get('/fetch-history', authenticateToken, (req, res) => {
 
   connection.query(query, params, (err, results) => {
     if (err) {
-      console.error('Error fetching conversation history:', err);
-      return res.status(500).json({ error: 'Failed to fetch history.' });
+      console.error("Error fetching conversation history:", err);
+      return res.status(500).json({ error: "Failed to fetch history." });
     }
     res.json({ history: results });
   });
 });
 
-
-
 app.listen(3000, () => {
   console.log("Node.js backend running on http://localhost:3000");
 });
-

@@ -441,6 +441,73 @@ app.get("/fetch-history", authenticateToken, (req, res) => {
   });
 });
 
+
+app.post('/upload', upload.single('file'), async (req, res) => {
+  const filePath = req.file.path;
+  const numQuestions = req.body.numQuestions;
+  const bloomLevel = req.body.bloomLevel;
+  const questionType = req.body.questionType;
+  const includeUseCase = req.body.includeUseCase;
+
+  try {
+    // Read the PDF file
+    const pdfBuffer = fs.readFileSync(filePath);
+    const data = await pdfParse(pdfBuffer);
+    const lectureText = data.text;
+
+    // Send the extracted text to the Python server
+    const response = await axios.post('http://localhost:8000/generate-questions', {
+      lecture_text: lectureText,
+      bloom_level: bloomLevel,
+      question_type: questionType,
+      num_questions: numQuestions,
+      include_use_case: includeUseCase
+    });
+
+    console.log('Response from Python server:', response.data);
+    res.json(response.data);
+  } catch (error) {
+    console.error('Error generating questions:', error);
+    res.status(500).send('Error generating questions');
+  } finally {
+    // Optionally delete the file after processing
+    fs.unlink(filePath, (err) => {
+      if (err) console.error(`Error deleting file: ${err}`);
+    });
+  }
+});
+
+// New endpoint for grammar checking
+app.post('/check-grammar', async (req, res) => {
+  const { userAnswerFile1 } = req.body;
+
+  if (!userAnswerFile1 || typeof userAnswerFile1 !== 'string') {
+    return res.status(400).json({ error: 'Invalid answer provided' });
+  }
+
+  console.log('Request body received:', req.body);
+
+  try {
+    const response = await axios.post('http://localhost:8001/check-grammar', {
+      userAnswerFile1: req.body.userAnswerFile1
+    }, {
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+    
+
+    console.log('Grammar check feedback:', response.data);
+    res.json(response.data);
+  } catch (error) {
+    console.error('Error checking grammar:', error.response?.data || error.message);
+    res.status(500).json({
+      error: 'Error checking grammar',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
 app.listen(3000, () => {
   console.log("Node.js backend running on http://localhost:3000");
 });

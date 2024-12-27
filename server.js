@@ -117,7 +117,7 @@ app.post(
   authenticateToken,
   upload.single("audio"),
   async (req, res) => {
-    const { type, difficulty, conversationId } = req.body; // Extract conversationId
+    const { type, difficulty, conversationId,jobDescription, skillsNeeded } = req.body; // Extract conversationId
     const audioFile = req.file;
     const userId = req.user.userId;
 
@@ -149,6 +149,8 @@ app.post(
       formData.append("difficulty", difficulty); // Include difficulty level
       formData.append("audio", audioFile.buffer, audioFile.originalname);
       formData.append("history", formattedHistory);
+      formData.append("jobDescription", jobDescription || ""); // Pass as empty string if not provided
+      formData.append("skillsNeeded", skillsNeeded || ""); // Pass as empty string if not provided
 
       // Send request to Python backend
       const response = await axios.post(
@@ -164,12 +166,9 @@ app.post(
       console.log("Response from Python API:", data);
 
       // Validate required fields
-      if (!data.transcription || !data.feedback || !data.follow_up_question) {
-        console.warn("Missing required fields:", {
-          transcription: data.transcription,
-          feedback: data.feedback,
-          follow_up_question: data.follow_up_question,
-        });
+      if (!data.transcription || !data.feedback || !data.grammar || !data.follow_up_question) {
+        console.warn("Missing required fields:", data);
+        return res.status(400).json({ error: "Incomplete response from Python backend." });
       }
 
       // Insert into conversation history if valid
@@ -177,14 +176,15 @@ app.post(
       if (data.transcription && data.feedback && data.follow_up_question) {
         await connection.promise().query(
           `INSERT INTO conversation_history 
-              (user_id, conversation_id, user_message, bot_response, feedback, timestamp) 
-           VALUES (?, ?, ?, ?, ?, NOW())`,
+           (user_id, conversation_id, user_message, bot_response, feedback, grammar_feedback, timestamp) 
+           VALUES (?, ?, ?, ?, ?, ?, NOW())`,
           [
             userId,
             newConversationId,
             data.transcription,
             data.follow_up_question,
-            data.feedback, // Add feedback content
+            data.feedback,
+            data.grammar, 
           ]
         );
       }
@@ -285,11 +285,11 @@ app.post("/login", (req, res) => {
       return res.status(401).json({ error: "Invalid credentials." });
     }
 
-    const payload = { userId: user.id };
-    const accessToken = jwt.sign(payload, secret, { expiresIn: "30m" });
-    const refreshToken = jwt.sign(payload, secret, { expiresIn: "7d" });
+    // Generate tokens
+    const accessToken = jwt.sign({ userId: user.id }, secret, { expiresIn: "30m" });
+    const refreshToken = jwt.sign({ userId: user.id }, refreshSecret, { expiresIn: "7d" });
 
-    // Store refresh token in the database (or cache)
+    // Store refresh token in the database
     connection.query(
       "UPDATE users SET refresh_token = ? WHERE id = ?",
       [refreshToken, user.id],
@@ -298,21 +298,23 @@ app.post("/login", (req, res) => {
       }
     );
 
-    // Send tokens
-    res.json({
-      accessToken,
-      refreshToken, // Ideally, send this in HttpOnly cookie
+    // Send tokens (refresh token as HttpOnly cookie)
+    res.cookie("refreshToken", refreshToken, {
+      httpOnly: true,
+      secure: false, // Use true in production with HTTPS
+      sameSite: "Strict",
     });
+    res.json({ accessToken });
   });
 });
+
 app.post("/refresh-token", (req, res) => {
-  const { refreshToken } = req.body;
+  const refreshToken = req.cookies.refreshToken; // Extract from cookie
 
   if (!refreshToken) {
     return res.status(401).json({ error: "Refresh token is required." });
   }
 
-  // Find the user by the refresh token
   connection.query(
     "SELECT * FROM users WHERE refresh_token = ?",
     [refreshToken],
@@ -322,7 +324,7 @@ app.post("/refresh-token", (req, res) => {
       }
 
       const user = results[0];
-      jwt.verify(refreshToken, secret, (err) => {
+      jwt.verify(refreshToken, refreshSecret, (err) => {
         if (err) {
           return res.status(403).json({ error: "Invalid or expired refresh token." });
         }
@@ -347,20 +349,26 @@ app.post("/logout", authenticateToken, (req, res) => {
         console.error("Error revoking refresh token:", err);
         return res.status(500).json({ error: "Failed to log out." });
       }
+      // Clear the refresh token cookie
+      res.clearCookie("refreshToken", {
+        httpOnly: true,
+        secure: false, // Use true in production with HTTPS
+        sameSite: "Strict",
+      });
       res.json({ message: "Logged out successfully." });
     }
   );
 });
+
 
 app.post(
   "/generate-script",
   authenticateToken,
   upload.none(),
   async (req, res) => {
-    const { tone } = req.body;
-    console.log("Tone:", req.body);
-    console.log("Tone2:", req);
-    console.log("Tone3:", tone);
+    const { tone , difficulty } = req.body;
+    console.log("Tone:", tone);
+    console.log("DIff:", difficulty);
     if (!tone) {
       return res.status(400).json({ error: "Tone and setting are required." });
     }
@@ -369,6 +377,7 @@ app.post(
       // Forward the 'tone' to FastAPI backend
       const formData = new FormData();
       formData.append("tone", tone);
+      formData.append("difficulty", difficulty);
 
       const response = await axios.post(
         "http://localhost:8000/generate-script",
@@ -415,7 +424,7 @@ app.get("/fetch-history", authenticateToken, (req, res) => {
   const { conversationId } = req.query; // Fetch conversation_id from query params
 
   let query = `
-    SELECT conversation_id, user_message, bot_response, timestamp ,feedback
+    SELECT conversation_id, user_message, bot_response, timestamp ,feedback , grammar_feedback
     FROM conversation_history
     WHERE user_id = ?
       AND timestamp >= NOW() - INTERVAL 15 DAY
@@ -507,6 +516,237 @@ app.post('/check-grammar', async (req, res) => {
     });
   }
 });
+
+app.post('/folders', authenticateToken, (req, res) => {
+  const { name } = req.body;
+  const userId = req.user.userId;
+
+  connection.query(
+    'INSERT INTO folders (name, user_id) VALUES (?, ?)',
+    [name, userId],
+    (err, result) => {
+      if (err) return res.status(500).json({ error: 'Failed to create folder' });
+      res.json({ id: result.insertId, name });
+    }
+  );
+});
+
+// Fetch all folders
+app.get('/folders', authenticateToken, (req, res) => {
+  const userId = req.user.userId;
+
+  connection.query(
+    'SELECT * FROM folders WHERE user_id = ?',
+    [userId],
+    (err, results) => {
+      if (err) return res.status(500).json({ error: 'Failed to fetch folders' });
+      res.json(results);
+    }
+  );
+});
+// delete folders
+app.delete('/folders/:folderId', authenticateToken, (req, res) => {
+  const { folderId } = req.params;
+
+  console.log(`Deleting chapters for folder ID: ${folderId}`);
+
+  // Delete related chapters first
+  connection.query(
+    'DELETE FROM chapters WHERE folder_id = ?',
+    [folderId],
+    (err) => {
+      if (err) {
+        console.error("Error deleting related chapters:", err);
+        return res.status(500).json({ error: 'Failed to delete related chapters' });
+      }
+
+      console.log(`Chapters for folder ID ${folderId} deleted.`);
+
+      // Proceed to delete the folder
+      connection.query(
+        'DELETE FROM folders WHERE id = ?',
+        [folderId],
+        (err) => {
+          if (err) {
+            console.error(`Error deleting folder ID ${folderId}:`, err);
+            return res.status(500).json({ error: 'Failed to delete folder' });
+          }
+
+          console.log(`Folder ID ${folderId} deleted successfully.`);
+          res.json({ message: 'Folder and related chapters deleted successfully' });
+        }
+      );
+    }
+  );
+});
+
+
+
+// edit
+app.put('/folders/:folderId', authenticateToken, (req, res) => {
+  const { folderId } = req.params;
+  const { name } = req.body;
+
+  connection.query(
+    'UPDATE folders SET name = ? WHERE id = ?',
+    [name, folderId],
+    (err) => {
+      if (err) return res.status(500).json({ error: 'Failed to update folder' });
+      res.json({ message: 'Folder updated successfully' });
+    }
+  );
+});
+// chapters
+app.post('/chapters', authenticateToken, upload.single('file'), async (req, res) => {
+  const { folderId, name } = req.body;
+  const file = req.file;
+
+  if (!file) {
+    return res.status(400).json({ error: 'PDF file is required.' });
+  }
+
+  try {
+    // Forward file to Python API for tree generation
+    const formData = new FormData();
+    formData.append('file', file.buffer, file.originalname);
+
+    const pythonResponse = await axios.post(
+      'http://localhost:8000/generate-tree',
+      formData,
+      { headers: formData.getHeaders() }
+    );
+    console.log('Python response:', pythonResponse.data.treeData);
+    const treeDataRaw = JSON.stringify(pythonResponse.data.tree_data, null, 0); // Minified version
+    const treeData = typeof treeDataRaw === 'string' 
+        ? JSON.stringify(JSON.parse(treeDataRaw), null, 0) 
+        : JSON.stringify(treeDataRaw, null, 0);
+    console.log('Tree data:', treeData);
+    connection.query(
+      'INSERT INTO chapters (folder_id, name, tree_data) VALUES (?, ?, ?)',
+      [folderId, name, treeData], // Pass serialized JSON
+      (err, result) => {
+        if (err) {
+          console.error('Error saving chapter:', err);
+          return res.status(500).json({ error: 'Failed to add chapter' });
+        }
+        res.json({ chapterId: result.insertId, name, treeData: JSON.parse(treeData) }); // Send parsed JSON back
+      }
+    );
+  } catch (error) {
+    console.error('Error generating tree:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to generate tree diagram.' });
+  }
+});
+//Get Chapters for a Folder
+app.get('/folders/:folderId/chapters', authenticateToken, (req, res) => {
+  const { folderId } = req.params;
+
+  connection.query(
+    'SELECT * FROM chapters WHERE folder_id = ?',
+    [folderId],
+    (err, results) => {
+      if (err) return res.status(500).json({ error: 'Failed to fetch chapters' });
+      res.json(results);
+    }
+  );
+});
+// chapter details
+app.get('/folders/:folderId/chapters', authenticateToken, (req, res) => {
+  const { folderId } = req.params;
+
+  connection.query(
+    'SELECT * FROM chapters WHERE folder_id = ?',
+    [folderId],
+    (err, results) => {
+      if (err) {
+        console.error('Error fetching chapters:', err);
+        return res.status(500).json({ error: 'Failed to fetch chapters' });
+      }
+
+      console.log('Fetched Chapters:', results); // Log the fetched chapters
+      res.json(results);
+    }
+  );
+});
+
+// update tree
+app.put('/chapters/:chapterId', authenticateToken, (req, res) => {
+  const { chapterId } = req.params;
+  const { treeData } = req.body;
+
+  connection.query(
+    'UPDATE chapters SET tree_data = ? WHERE id = ?',
+    [JSON.stringify(treeData), chapterId],
+    (err) => {
+      if (err) return res.status(500).json({ error: 'Failed to update chapter' });
+      res.json({ message: 'Tree data updated successfully' });
+    }
+  );
+});
+// delete 
+app.delete('/chapters/:chapterId', authenticateToken, (req, res) => {
+  const { chapterId } = req.params;
+
+  connection.query(
+    'DELETE FROM chapters WHERE id = ?',
+    [chapterId],
+    (err) => {
+      if (err) return res.status(500).json({ error: 'Failed to delete chapter' });
+      res.json({ message: 'Chapter deleted successfully' });
+    }
+  );
+});
+
+app.get('/chapters/:chapterId', authenticateToken, (req, res) => {
+  const { chapterId } = req.params;
+
+  connection.query(
+    'SELECT id, name, tree_data FROM chapters WHERE id = ?',
+    [chapterId],
+    (err, results) => {
+      if (err) {
+        console.error('Error fetching chapter details:', err);
+        return res.status(500).json({ error: 'Failed to fetch chapter details.' });
+      }
+
+      if (results.length === 0) {
+        return res.status(404).json({ error: 'Chapter not found.' });
+      }
+
+      const chapter = results[0];
+
+      // Check if `tree_data` is already an object or needs parsing
+      let treeData;
+      try {
+        treeData =
+          typeof chapter.tree_data === 'string'
+            ? JSON.parse(chapter.tree_data) // Parse if it's a string
+            : chapter.tree_data; // Directly use if it's already an object
+      } catch (error) {
+        console.error('Error parsing tree_data:', error);
+        return res.status(500).json({ error: 'Invalid tree_data format.' });
+      }
+
+      res.json({
+        id: chapter.id,
+        name: chapter.name,
+        treeData, // Send the parsed/validated tree data to the frontend
+      });
+    }
+  );
+});
+
+app.post("/validate-token", (req, res) => {
+  const { token } = req.body;
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    res.json({ valid: true });
+  } catch (err) {
+    res.json({ valid: false });
+  }
+});
+
 
 app.post('/evaluate-answer', async (req, res) => {
   const { questionsForFile1, userAnswerFile1, useCase1, questionsForFile2, userAnswerFile2, useCase2 } = req.body;  // Get the required data from the request body

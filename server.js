@@ -517,8 +517,6 @@ app.post('/check-grammar', async (req, res) => {
   }
 });
 
-// pdf to tree generation 
-// create all folders
 app.post('/folders', authenticateToken, (req, res) => {
   const { name } = req.body;
   const userId = req.user.userId;
@@ -750,7 +748,51 @@ app.post("/validate-token", (req, res) => {
 });
 
 
+app.post('/evaluate-answer', async (req, res) => {
+  const { questionsForFile1, userAnswerFile1, useCase1, questionsForFile2, userAnswerFile2, useCase2 } = req.body;  // Get the required data from the request body
 
+  try {
+    // Build request body based on what's provided
+    const requestBody = {};
+    
+    // Add file 1 data if provided
+    if (questionsForFile1 && userAnswerFile1) {
+      requestBody.questionsForFile1 = questionsForFile1;
+      requestBody.userAnswerFile1 = userAnswerFile1;
+      requestBody.useCase1 = useCase1 || '';
+    }
+    
+    // Add file 2 data if provided
+    if (questionsForFile2 && userAnswerFile2) {
+      requestBody.questionsForFile2 = questionsForFile2;
+      requestBody.userAnswerFile2 = userAnswerFile2;
+      requestBody.useCase2 = useCase2 || '';
+    }
+
+    // Check if we have at least one file's data
+    if (!Object.keys(requestBody).length) {
+      return res.status(422).json({
+        error: 'Missing data',
+        details: 'Please provide data for at least one file'
+      });
+    }
+
+    const response = await axios.post('http://localhost:8002/evaluate-answer', requestBody, {
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+
+    res.json(response.data);
+
+  } catch (error) {
+    console.error('Error evaluating answer:', error.response?.data || error.message);
+    res.status(error.response?.status || 500).json({
+      error: 'Error evaluating answer',
+      details: error.response?.data || error.message
+    });
+  }
+});
 
 app.listen(3000, () => {
   console.log("Node.js backend running on http://localhost:3000");

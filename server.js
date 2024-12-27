@@ -9,11 +9,15 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const secret = process.env.JWT_SECRET; // Ensure you set this in your environment variables
 const refreshSecret = process.env.JWT_REFRESH_SECRET; // Secret key for refresh tokens
+const fs = require('fs');
+const path = require('path');
+
 
 const app = express();
 // Enable CORS for all routes
 app.use(cors());
 app.use(express.json());
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
@@ -450,7 +454,6 @@ app.get("/fetch-history", authenticateToken, (req, res) => {
   });
 });
 
-
 app.post('/upload', upload.single('file'), async (req, res) => {
   const filePath = req.file.path;
   const numQuestions = req.body.numQuestions;
@@ -472,9 +475,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
       num_questions: numQuestions,
       include_use_case: includeUseCase
     });
-
-    console.log('Response from Python server:', response.data);
-    res.json(response.data);
+    
   } catch (error) {
     console.error('Error generating questions:', error);
     res.status(500).send('Error generating questions');
@@ -504,7 +505,6 @@ app.post('/check-grammar', async (req, res) => {
         'Content-Type': 'application/json'
       }
     });
-    
 
     console.log('Grammar check feedback:', response.data);
     res.json(response.data);
@@ -792,6 +792,311 @@ app.post('/evaluate-answer', async (req, res) => {
       details: error.response?.data || error.message
     });
   }
+});
+
+app.post('/check-cognitive-level', async (req, res) => {
+  const { userAnswer, bloomLevel } = req.body;
+
+  try {
+    // Check cognitive level for userAnswerFile1
+    const response = await axios.post('http://localhost:8003/check-cognitive-level', {
+      userAnswer: userAnswer,
+      bloomLevel: bloomLevel
+    }, {
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+
+    res.json({ feedback});
+
+  } catch (error) {
+    console.error('Error checking level:', error.response?.data || error.message);
+    res.status(error.response?.status || 500).json({
+      error: 'Error checking level',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
+// Endpoint to save questions and answers
+app.post('/save-questions-and-answers', authenticateToken, (req, res) => {
+  const { userId } = req.user;
+  const { questionsAndAnswers } = req.body;
+
+  if (!questionsAndAnswers || !Array.isArray(questionsAndAnswers) || questionsAndAnswers.length === 0) {
+    return res.status(400).json({ error: "Invalid input. Questions and answers are required." });
+  }
+
+  const generationId = generateGenerationId(); // Generate a new generation ID
+  generationCounter++; // Increment generation counter for the next generation
+
+  const values = questionsAndAnswers.map((qa) => [
+    generationId,
+    userId,
+    qa.questionId,
+    qa.caseScenario || null, 
+    qa.question, 
+    qa.answer,
+  ]);
+
+  const query = `
+    INSERT INTO questions (generation_id, user_id, question_id, case_scenario, question_text, answer_text)
+    VALUES ?;
+  `;
+
+  connection.query(query, [values], (err) => {
+    if (err) {
+      console.error("Error storing questions and answers:", err);
+      return res.status(500).json({ error: "Failed to store questions and answers." });
+    }
+    res.json({ message: "Questions and answers stored successfully.", generationId });
+  });
+});
+
+app.post('/update-favorite', authenticateToken, (req, res) => {
+  const { userId } = req.user;
+  const { questionId, favorited } = req.body;
+
+  if (!questionId || typeof favorited !== 'boolean') {
+    return res.status(400).json({ error: "Invalid input. Question ID and favorite status are required." });
+  }
+
+  const query = `
+    UPDATE questions
+    SET favourited = ?
+    WHERE user_id = ? AND question_id = ?;
+  `;
+
+  connection.query(query, [favorited, userId, questionId], (err, result) => {
+    if (err) {
+      console.error("Error updating favorite status:", err);
+      return res.status(500).json({ error: "Failed to update favorite status." });
+    }
+    res.json({ message: "Favorite status updated successfully.", affectedRows: result.affectedRows });
+  });
+});
+
+let generationCounter = 1;
+
+function generateGenerationId() {
+  return `gid${String(generationCounter).padStart(4, '0')}`;
+}
+
+// Initialize counters based on the highest existing IDs in the database
+function initializeCounters() {
+  connection.query('SELECT MAX(generation_id) AS maxGenerationId FROM questions', (err, results) => {
+    if (err) {
+      console.error('Error fetching max generation_id:', err);
+      return;
+    }
+    const maxGenerationId = results[0].maxGenerationId;
+    if (maxGenerationId) {
+      generationCounter = parseInt(maxGenerationId.replace('gid', ''), 10) + 1;
+    }
+  });
+}
+
+// Call initializeCounters when the server starts
+initializeCounters();
+
+app.get('/fetch-questions', authenticateToken, (req, res) => {
+  const { userId } = req.user;
+
+  // SQL Query to fetch questions grouped by generation_id and sorted by date
+  const query = `
+    SELECT 
+      generation_id, 
+      DATE(created_at) AS date, 
+      question_id, 
+      case_scenario, 
+      question_text, 
+      answer_text,
+      favourited 
+    FROM questions 
+    WHERE user_id = ? 
+    ORDER BY date DESC, generation_id ASC;
+  `;
+
+  connection.query(query, [userId], (err, results) => {
+    if (err) {
+      console.error("Error fetching questions:", err);
+      return res.status(500).json({ error: "Failed to fetch questions." });
+    }
+
+    // Group results by date and generation_id
+    const groupedQuestions = results.reduce((acc, item) => {
+      const { date, generation_id, question_id, case_scenario, question_text, answer_text } = item;
+
+      if (!acc[date]) acc[date] = {}; // Initialise date group
+      if (!acc[date][generation_id]) acc[date][generation_id] = []; // Initialise generation_id group
+
+      acc[date][generation_id].push({
+        questionId: question_id,
+        useCase: case_scenario,
+        questionText: question_text,
+        answerText: answer_text,
+      });
+
+      return acc;
+    }, {});
+
+    res.json({ groupedQuestions });
+  });
+});
+
+app.get('/fetch-favorites', authenticateToken, (req, res) => {
+  const { userId } = req.user;
+
+  const query = `
+    SELECT question_id, case_scenario, question_text, answer_text
+    FROM questions
+    WHERE user_id = ? AND favourited = true;
+  `;
+
+  connection.query(query, [userId], (err, results) => {
+    if (err) {
+      console.error("Error fetching favorite questions:", err);
+      return res.status(500).json({ error: "Failed to fetch favorite questions." });
+    }
+    res.json({ favorites: results });
+  });
+});
+
+// Fetch user data
+app.get('/fetch-user', authenticateToken, (req, res) => {
+  const { userId } = req.user;
+
+  const query = `
+    SELECT 
+      username, 
+      email, 
+      created_at,
+      profile_picture AS profilePictureUrl
+    FROM users 
+    WHERE id = ?;
+  `;
+
+  connection.query(query, [userId], (err, results) => {
+    if (err) {
+      console.error("Error fetching user data:", err);
+      return res.status(500).json({ error: "Failed to fetch user data." });
+    }
+
+    if (results.length === 0) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    const userData = results[0];
+    console.log('User data:', userData);
+    res.json({ userData });
+  });
+});
+
+app.post('/upload-profile-picture', authenticateToken, upload.single('profilePicture'), (req, res) => {
+  const { userId } = req.user;
+
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded.' });
+  }
+
+  // Create a unique filename
+  const filename = Date.now() + '-' + req.file.originalname;
+  
+  // Define the file path where the image will be saved
+  const filePath = path.join(__dirname, 'uploads', filename);
+  
+  // Write the file buffer to the uploads directory
+  fs.writeFile(filePath, req.file.buffer, (err) => {
+    if (err) {
+      console.error('Error saving file:', err);
+      return res.status(500).json({ error: 'Failed to save file.' });
+    }
+
+    // Construct the URL to access the file
+    const profilePictureUrl = `${req.protocol}://${req.get('host')}/uploads/${filename}`;
+    
+    // Save the URL to the database or respond to the client
+    const query = `
+      UPDATE users
+      SET profile_picture = ?
+      WHERE id = ?;
+    `;
+    
+    connection.query(query, [profilePictureUrl, userId], (err) => {
+      if (err) {
+        console.error('Error updating profile picture:', err);
+        return res.status(500).json({ error: 'Failed to update profile picture.' });
+      }
+
+      res.json({ profilePictureUrl });
+    });
+  });
+});
+
+app.post('/update-user-details', authenticateToken, (req, res) => {
+  const { userId } = req.user;
+  const { username, email } = req.body;
+
+  const query = `
+    UPDATE users
+    SET username = ?, email = ?
+    WHERE id = ?;
+  `;
+
+  connection.query(query, [username, email, userId], (err) => {
+    if (err) {
+      console.error('Error updating user details:', err);
+      return res.status(500).json({ error: 'Failed to update user details.' });
+    }
+
+    res.json({ message: 'User details updated successfully.' });
+  });
+});
+
+// Endpoint to change password
+app.post('/change-password', authenticateToken, async (req, res) => {
+  const { userId } = req.user;
+  const { newPassword } = req.body;
+
+  if (!newPassword) {
+    return res.status(400).json({ error: 'New password is required.' });
+  }
+
+  try {
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    connection.query('UPDATE users SET password = ? WHERE id = ?', [hashedPassword, userId], (err) => {
+      if (err) {
+        console.error('Error updating password:', err);
+        return res.status(500).json({ error: 'Failed to update password.' });
+      }
+      res.json({ message: 'Password updated successfully.' });
+    });
+  } catch (error) {
+    console.error('Error hashing password:', error);
+    res.status(500).json({ error: 'Failed to hash password.' });
+  }
+});
+
+app.post('/update-email', authenticateToken, (req, res) => {
+  const { userId } = req.user;
+  const { email } = req.body;
+
+  const query = `
+    UPDATE users
+    SET email = ?
+    WHERE id = ?;
+  `;
+
+  connection.query(query, [email, userId], (err) => {
+    if (err) {
+      console.error('Error updating email:', err);
+      return res.status(500).json({ error: 'Failed to update email.' });
+    }
+
+    res.json({ message: 'Email updated successfully.' });
+  });
 });
 
 app.listen(3000, () => {

@@ -113,10 +113,11 @@ app.post(
   authenticateToken,
   upload.single("audio"),
   async (req, res) => {
-    const { type, difficulty, conversationId,jobDescription, skillsNeeded } = req.body; // Extract conversationId
+    const { type, difficulty, conversationId, jobDescription, name } =
+      req.body; // Extract conversationId
     const audioFile = req.file;
     const userId = req.user.userId;
-
+    console.log("Request body:", req.body);
     try {
       console.log("Fetching conversation history...");
       let formattedHistory = "";
@@ -136,7 +137,7 @@ app.post(
           )
           .join("\n");
       }
-
+      console.log("Formatted history:", formattedHistory);
       console.log("Sending request to Python backend...");
 
       // Prepare formData for audio, history, and difficulty
@@ -146,7 +147,6 @@ app.post(
       formData.append("audio", audioFile.buffer, audioFile.originalname);
       formData.append("history", formattedHistory);
       formData.append("jobDescription", jobDescription || ""); // Pass as empty string if not provided
-      formData.append("skillsNeeded", skillsNeeded || ""); // Pass as empty string if not provided
 
       // Send request to Python backend
       const response = await axios.post(
@@ -162,9 +162,16 @@ app.post(
       console.log("Response from Python API:", data);
 
       // Validate required fields
-      if (!data.transcription || !data.feedback || !data.grammar || !data.follow_up_question) {
+      if (
+        !data.transcription ||
+        !data.feedback ||
+        !data.grammar ||
+        !data.follow_up_question
+      ) {
         console.warn("Missing required fields:", data);
-        return res.status(400).json({ error: "Incomplete response from Python backend." });
+        return res
+          .status(400)
+          .json({ error: "Incomplete response from Python backend." });
       }
 
       // Insert into conversation history if valid
@@ -172,15 +179,18 @@ app.post(
       if (data.transcription && data.feedback && data.follow_up_question) {
         await connection.promise().query(
           `INSERT INTO conversation_history 
-           (user_id, conversation_id, user_message, bot_response, feedback, grammar_feedback, timestamp) 
-           VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+           (user_id, conversation_id, user_message, bot_response, feedback, grammar_feedback, name, job_description, timestamp , difficulty) 
+           VALUES (?, ?, ?, ?, ?, ?, ?,?, NOW(), ?)`,
           [
             userId,
             newConversationId,
             data.transcription,
             data.follow_up_question,
             data.feedback,
-            data.grammar, 
+            data.grammar,
+            name || null, // Save the name if provided
+            jobDescription || null, // Save Job Description
+            difficulty || easy,
           ]
         );
       }
@@ -196,6 +206,22 @@ app.post(
     }
   }
 );
+app.delete("/conversation/:conversationId", authenticateToken, (req, res) => {
+  const { conversationId } = req.params;
+  const { userId } = req.user;
+  console.log("Deleting conversation:", conversationId);
+  connection.query(
+      "DELETE FROM conversation_history WHERE conversation_id = ? AND user_id = ?",
+      [conversationId, userId],
+      (err, results) => {
+          if (err) {
+              console.error("Error deleting conversation:", err);
+              return res.status(500).json({ error: "Failed to delete conversation." });
+          }
+          res.json({ message: "Conversation deleted successfully." });
+      }
+  );
+});
 
 app.get("/get-audio/:filename", async (req, res) => {
   const { filename } = req.params;
@@ -282,8 +308,12 @@ app.post("/login", (req, res) => {
     }
 
     // Generate tokens
-    const accessToken = jwt.sign({ userId: user.id }, secret, { expiresIn: "30m" });
-    const refreshToken = jwt.sign({ userId: user.id }, refreshSecret, { expiresIn: "7d" });
+    const accessToken = jwt.sign({ userId: user.id }, secret, {
+      expiresIn: "3d",
+    });
+    const refreshToken = jwt.sign({ userId: user.id }, refreshSecret, {
+      expiresIn: "7d",
+    });
 
     // Store refresh token in the database
     connection.query(
@@ -316,23 +346,28 @@ app.post("/refresh-token", (req, res) => {
     [refreshToken],
     (err, results) => {
       if (err || results.length === 0) {
-        return res.status(403).json({ error: "Invalid or expired refresh token." });
+        return res
+          .status(403)
+          .json({ error: "Invalid or expired refresh token." });
       }
 
       const user = results[0];
       jwt.verify(refreshToken, refreshSecret, (err) => {
         if (err) {
-          return res.status(403).json({ error: "Invalid or expired refresh token." });
+          return res
+            .status(403)
+            .json({ error: "Invalid or expired refresh token." });
         }
 
         // Generate a new access token
-        const newAccessToken = jwt.sign({ userId: user.id }, secret, { expiresIn: "30m" });
+        const newAccessToken = jwt.sign({ userId: user.id }, secret, {
+          expiresIn: "30m",
+        });
         res.json({ accessToken: newAccessToken });
       });
     }
   );
 });
-
 
 app.post("/logout", authenticateToken, (req, res) => {
   const { userId } = req.user;
@@ -356,13 +391,12 @@ app.post("/logout", authenticateToken, (req, res) => {
   );
 });
 
-
 app.post(
   "/generate-script",
   authenticateToken,
   upload.none(),
   async (req, res) => {
-    const { tone , difficulty } = req.body;
+    const { tone, difficulty } = req.body;
     console.log("Tone:", tone);
     console.log("DIff:", difficulty);
     if (!tone) {
@@ -396,7 +430,7 @@ app.post(
 app.post("/store-history", authenticateToken, async (req, res) => {
   const { userId } = req.user;
   const { conversationId, userMessage, botResponse } = req.body;
-
+  console.log("Request body:", req.body);
   if (!conversationId || !userMessage || !botResponse) {
     console.error("Missing required fields:", req.body);
     return res.status(400).json({ error: "All fields are required." });
@@ -420,7 +454,7 @@ app.get("/fetch-history", authenticateToken, (req, res) => {
   const { conversationId } = req.query; // Fetch conversation_id from query params
 
   let query = `
-    SELECT conversation_id, user_message, bot_response, timestamp ,feedback , grammar_feedback
+    SELECT conversation_id, user_message, bot_response, timestamp ,feedback , grammar_feedback , name
     FROM conversation_history
     WHERE user_id = ?
       AND timestamp >= NOW() - INTERVAL 15 DAY
@@ -432,12 +466,16 @@ app.get("/fetch-history", authenticateToken, (req, res) => {
     params.push(conversationId);
   } else {
     query = `
-      SELECT DISTINCT conversation_id, MAX(timestamp) AS latest_timestamp
-      FROM conversation_history
-      WHERE user_id = ?
-        AND timestamp >= NOW() - INTERVAL 15 DAY
-      GROUP BY conversation_id
-      ORDER BY latest_timestamp DESC
+          SELECT ch.conversation_id, MAX(ch.timestamp) AS latest_timestamp, 
+                (SELECT name 
+                  FROM conversation_history 
+                  WHERE conversation_id = ch.conversation_id 
+                  ORDER BY timestamp DESC LIMIT 1) AS name
+          FROM conversation_history ch
+          WHERE ch.user_id = 1
+            AND ch.timestamp >= NOW() - INTERVAL 15 DAY
+          GROUP BY ch.conversation_id
+          ORDER BY latest_timestamp DESC;
     `;
   }
 
@@ -450,8 +488,7 @@ app.get("/fetch-history", authenticateToken, (req, res) => {
   });
 });
 
-
-app.post('/upload', upload.single('file'), async (req, res) => {
+app.post("/upload", upload.single("file"), async (req, res) => {
   const filePath = req.file.path;
   const numQuestions = req.body.numQuestions;
   const bloomLevel = req.body.bloomLevel;
@@ -465,19 +502,22 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     const lectureText = data.text;
 
     // Send the extracted text to the Python server
-    const response = await axios.post('http://localhost:8000/generate-questions', {
-      lecture_text: lectureText,
-      bloom_level: bloomLevel,
-      question_type: questionType,
-      num_questions: numQuestions,
-      include_use_case: includeUseCase
-    });
+    const response = await axios.post(
+      "http://localhost:8000/generate-questions",
+      {
+        lecture_text: lectureText,
+        bloom_level: bloomLevel,
+        question_type: questionType,
+        num_questions: numQuestions,
+        include_use_case: includeUseCase,
+      }
+    );
 
-    console.log('Response from Python server:', response.data);
+    console.log("Response from Python server:", response.data);
     res.json(response.data);
   } catch (error) {
-    console.error('Error generating questions:', error);
-    res.status(500).send('Error generating questions');
+    console.error("Error generating questions:", error);
+    res.status(500).send("Error generating questions");
   } finally {
     // Optionally delete the file after processing
     fs.unlink(filePath, (err) => {
@@ -487,230 +527,258 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 });
 
 // New endpoint for grammar checking
-app.post('/check-grammar', async (req, res) => {
+app.post("/check-grammar", async (req, res) => {
   const { userAnswerFile1 } = req.body;
 
-  if (!userAnswerFile1 || typeof userAnswerFile1 !== 'string') {
-    return res.status(400).json({ error: 'Invalid answer provided' });
+  if (!userAnswerFile1 || typeof userAnswerFile1 !== "string") {
+    return res.status(400).json({ error: "Invalid answer provided" });
   }
 
-  console.log('Request body received:', req.body);
+  console.log("Request body received:", req.body);
 
   try {
-    const response = await axios.post('http://localhost:8001/check-grammar', {
-      userAnswerFile1: req.body.userAnswerFile1
-    }, {
-      headers: {
-        'Content-Type': 'application/json'
+    const response = await axios.post(
+      "http://localhost:8001/check-grammar",
+      {
+        userAnswerFile1: req.body.userAnswerFile1,
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
       }
-    });
-    
+    );
 
-    console.log('Grammar check feedback:', response.data);
+    console.log("Grammar check feedback:", response.data);
     res.json(response.data);
   } catch (error) {
-    console.error('Error checking grammar:', error.response?.data || error.message);
+    console.error(
+      "Error checking grammar:",
+      error.response?.data || error.message
+    );
     res.status(500).json({
-      error: 'Error checking grammar',
-      details: error.response?.data || error.message
+      error: "Error checking grammar",
+      details: error.response?.data || error.message,
     });
   }
 });
 
-app.post('/folders', authenticateToken, (req, res) => {
+app.post("/folders", authenticateToken, (req, res) => {
   const { name } = req.body;
   const userId = req.user.userId;
 
   connection.query(
-    'INSERT INTO folders (name, user_id) VALUES (?, ?)',
+    "INSERT INTO folders (name, user_id) VALUES (?, ?)",
     [name, userId],
     (err, result) => {
-      if (err) return res.status(500).json({ error: 'Failed to create folder' });
+      if (err)
+        return res.status(500).json({ error: "Failed to create folder" });
       res.json({ id: result.insertId, name });
     }
   );
 });
 
 // Fetch all folders
-app.get('/folders', authenticateToken, (req, res) => {
+app.get("/folders", authenticateToken, (req, res) => {
   const userId = req.user.userId;
 
   connection.query(
-    'SELECT * FROM folders WHERE user_id = ?',
+    "SELECT * FROM folders WHERE user_id = ?",
     [userId],
     (err, results) => {
-      if (err) return res.status(500).json({ error: 'Failed to fetch folders' });
+      if (err)
+        return res.status(500).json({ error: "Failed to fetch folders" });
       res.json(results);
     }
   );
 });
 // delete folders
-app.delete('/folders/:folderId', authenticateToken, (req, res) => {
+app.delete("/folders/:folderId", authenticateToken, (req, res) => {
   const { folderId } = req.params;
 
   console.log(`Deleting chapters for folder ID: ${folderId}`);
 
   // Delete related chapters first
   connection.query(
-    'DELETE FROM chapters WHERE folder_id = ?',
+    "DELETE FROM chapters WHERE folder_id = ?",
     [folderId],
     (err) => {
       if (err) {
         console.error("Error deleting related chapters:", err);
-        return res.status(500).json({ error: 'Failed to delete related chapters' });
+        return res
+          .status(500)
+          .json({ error: "Failed to delete related chapters" });
       }
 
       console.log(`Chapters for folder ID ${folderId} deleted.`);
 
       // Proceed to delete the folder
       connection.query(
-        'DELETE FROM folders WHERE id = ?',
+        "DELETE FROM folders WHERE id = ?",
         [folderId],
         (err) => {
           if (err) {
             console.error(`Error deleting folder ID ${folderId}:`, err);
-            return res.status(500).json({ error: 'Failed to delete folder' });
+            return res.status(500).json({ error: "Failed to delete folder" });
           }
 
           console.log(`Folder ID ${folderId} deleted successfully.`);
-          res.json({ message: 'Folder and related chapters deleted successfully' });
+          res.json({
+            message: "Folder and related chapters deleted successfully",
+          });
         }
       );
     }
   );
 });
 
-
-
 // edit
-app.put('/folders/:folderId', authenticateToken, (req, res) => {
+app.put("/folders/:folderId", authenticateToken, (req, res) => {
   const { folderId } = req.params;
   const { name } = req.body;
 
   connection.query(
-    'UPDATE folders SET name = ? WHERE id = ?',
+    "UPDATE folders SET name = ? WHERE id = ?",
     [name, folderId],
     (err) => {
-      if (err) return res.status(500).json({ error: 'Failed to update folder' });
-      res.json({ message: 'Folder updated successfully' });
+      if (err)
+        return res.status(500).json({ error: "Failed to update folder" });
+      res.json({ message: "Folder updated successfully" });
     }
   );
 });
 // chapters
-app.post('/chapters', authenticateToken, upload.single('file'), async (req, res) => {
-  const { folderId, name } = req.body;
-  const file = req.file;
+app.post(
+  "/chapters",
+  authenticateToken,
+  upload.single("file"),
+  async (req, res) => {
+    const { folderId, name } = req.body;
+    const file = req.file;
 
-  if (!file) {
-    return res.status(400).json({ error: 'PDF file is required.' });
-  }
+    if (!file) {
+      return res.status(400).json({ error: "PDF file is required." });
+    }
 
-  try {
-    // Forward file to Python API for tree generation
-    const formData = new FormData();
-    formData.append('file', file.buffer, file.originalname);
+    try {
+      // Forward file to Python API for tree generation
+      const formData = new FormData();
+      formData.append("file", file.buffer, file.originalname);
 
-    const pythonResponse = await axios.post(
-      'http://localhost:8000/generate-tree',
-      formData,
-      { headers: formData.getHeaders() }
-    );
-    console.log('Python response:', pythonResponse.data.treeData);
-    const treeDataRaw = JSON.stringify(pythonResponse.data.tree_data, null, 0); // Minified version
-    const treeData = typeof treeDataRaw === 'string' 
-        ? JSON.stringify(JSON.parse(treeDataRaw), null, 0) 
-        : JSON.stringify(treeDataRaw, null, 0);
-    console.log('Tree data:', treeData);
-    connection.query(
-      'INSERT INTO chapters (folder_id, name, tree_data) VALUES (?, ?, ?)',
-      [folderId, name, treeData], // Pass serialized JSON
-      (err, result) => {
-        if (err) {
-          console.error('Error saving chapter:', err);
-          return res.status(500).json({ error: 'Failed to add chapter' });
+      const pythonResponse = await axios.post(
+        "http://localhost:8000/generate-tree",
+        formData,
+        { headers: formData.getHeaders() }
+      );
+      console.log("Python response:", pythonResponse.data.treeData);
+      const treeDataRaw = JSON.stringify(
+        pythonResponse.data.tree_data,
+        null,
+        0
+      ); // Minified version
+      const treeData =
+        typeof treeDataRaw === "string"
+          ? JSON.stringify(JSON.parse(treeDataRaw), null, 0)
+          : JSON.stringify(treeDataRaw, null, 0);
+      console.log("Tree data:", treeData);
+      connection.query(
+        "INSERT INTO chapters (folder_id, name, tree_data) VALUES (?, ?, ?)",
+        [folderId, name, treeData], // Pass serialized JSON
+        (err, result) => {
+          if (err) {
+            console.error("Error saving chapter:", err);
+            return res.status(500).json({ error: "Failed to add chapter" });
+          }
+          res.json({
+            chapterId: result.insertId,
+            name,
+            treeData: JSON.parse(treeData),
+          }); // Send parsed JSON back
         }
-        res.json({ chapterId: result.insertId, name, treeData: JSON.parse(treeData) }); // Send parsed JSON back
-      }
-    );
-  } catch (error) {
-    console.error('Error generating tree:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Failed to generate tree diagram.' });
+      );
+    } catch (error) {
+      console.error(
+        "Error generating tree:",
+        error.response?.data || error.message
+      );
+      res.status(500).json({ error: "Failed to generate tree diagram." });
+    }
   }
-});
+);
 //Get Chapters for a Folder
-app.get('/folders/:folderId/chapters', authenticateToken, (req, res) => {
+app.get("/folders/:folderId/chapters", authenticateToken, (req, res) => {
   const { folderId } = req.params;
 
   connection.query(
-    'SELECT * FROM chapters WHERE folder_id = ?',
+    "SELECT * FROM chapters WHERE folder_id = ?",
     [folderId],
     (err, results) => {
-      if (err) return res.status(500).json({ error: 'Failed to fetch chapters' });
+      if (err)
+        return res.status(500).json({ error: "Failed to fetch chapters" });
       res.json(results);
     }
   );
 });
 // chapter details
-app.get('/folders/:folderId/chapters', authenticateToken, (req, res) => {
+app.get("/folders/:folderId/chapters", authenticateToken, (req, res) => {
   const { folderId } = req.params;
 
   connection.query(
-    'SELECT * FROM chapters WHERE folder_id = ?',
+    "SELECT * FROM chapters WHERE folder_id = ?",
     [folderId],
     (err, results) => {
       if (err) {
-        console.error('Error fetching chapters:', err);
-        return res.status(500).json({ error: 'Failed to fetch chapters' });
+        console.error("Error fetching chapters:", err);
+        return res.status(500).json({ error: "Failed to fetch chapters" });
       }
 
-      console.log('Fetched Chapters:', results); // Log the fetched chapters
+      console.log("Fetched Chapters:", results); // Log the fetched chapters
       res.json(results);
     }
   );
 });
 
 // update tree
-app.put('/chapters/:chapterId', authenticateToken, (req, res) => {
+app.put("/chapters/:chapterId", authenticateToken, (req, res) => {
   const { chapterId } = req.params;
   const { treeData } = req.body;
 
   connection.query(
-    'UPDATE chapters SET tree_data = ? WHERE id = ?',
+    "UPDATE chapters SET tree_data = ? WHERE id = ?",
     [JSON.stringify(treeData), chapterId],
     (err) => {
-      if (err) return res.status(500).json({ error: 'Failed to update chapter' });
-      res.json({ message: 'Tree data updated successfully' });
+      if (err)
+        return res.status(500).json({ error: "Failed to update chapter" });
+      res.json({ message: "Tree data updated successfully" });
     }
   );
 });
-// delete 
-app.delete('/chapters/:chapterId', authenticateToken, (req, res) => {
+// delete
+app.delete("/chapters/:chapterId", authenticateToken, (req, res) => {
   const { chapterId } = req.params;
 
-  connection.query(
-    'DELETE FROM chapters WHERE id = ?',
-    [chapterId],
-    (err) => {
-      if (err) return res.status(500).json({ error: 'Failed to delete chapter' });
-      res.json({ message: 'Chapter deleted successfully' });
-    }
-  );
+  connection.query("DELETE FROM chapters WHERE id = ?", [chapterId], (err) => {
+    if (err) return res.status(500).json({ error: "Failed to delete chapter" });
+    res.json({ message: "Chapter deleted successfully" });
+  });
 });
 
-app.get('/chapters/:chapterId', authenticateToken, (req, res) => {
+app.get("/chapters/:chapterId", authenticateToken, (req, res) => {
   const { chapterId } = req.params;
 
   connection.query(
-    'SELECT id, name, tree_data FROM chapters WHERE id = ?',
+    "SELECT id, name, tree_data FROM chapters WHERE id = ?",
     [chapterId],
     (err, results) => {
       if (err) {
-        console.error('Error fetching chapter details:', err);
-        return res.status(500).json({ error: 'Failed to fetch chapter details.' });
+        console.error("Error fetching chapter details:", err);
+        return res
+          .status(500)
+          .json({ error: "Failed to fetch chapter details." });
       }
 
       if (results.length === 0) {
-        return res.status(404).json({ error: 'Chapter not found.' });
+        return res.status(404).json({ error: "Chapter not found." });
       }
 
       const chapter = results[0];
@@ -719,12 +787,12 @@ app.get('/chapters/:chapterId', authenticateToken, (req, res) => {
       let treeData;
       try {
         treeData =
-          typeof chapter.tree_data === 'string'
+          typeof chapter.tree_data === "string"
             ? JSON.parse(chapter.tree_data) // Parse if it's a string
             : chapter.tree_data; // Directly use if it's already an object
       } catch (error) {
-        console.error('Error parsing tree_data:', error);
-        return res.status(500).json({ error: 'Invalid tree_data format.' });
+        console.error("Error parsing tree_data:", error);
+        return res.status(500).json({ error: "Invalid tree_data format." });
       }
 
       res.json({
@@ -747,49 +815,61 @@ app.post("/validate-token", (req, res) => {
   }
 });
 
-
-app.post('/evaluate-answer', async (req, res) => {
-  const { questionsForFile1, userAnswerFile1, useCase1, questionsForFile2, userAnswerFile2, useCase2 } = req.body;  // Get the required data from the request body
+app.post("/evaluate-answer", async (req, res) => {
+  const {
+    questionsForFile1,
+    userAnswerFile1,
+    useCase1,
+    questionsForFile2,
+    userAnswerFile2,
+    useCase2,
+  } = req.body; // Get the required data from the request body
 
   try {
     // Build request body based on what's provided
     const requestBody = {};
-    
+
     // Add file 1 data if provided
     if (questionsForFile1 && userAnswerFile1) {
       requestBody.questionsForFile1 = questionsForFile1;
       requestBody.userAnswerFile1 = userAnswerFile1;
-      requestBody.useCase1 = useCase1 || '';
+      requestBody.useCase1 = useCase1 || "";
     }
-    
+
     // Add file 2 data if provided
     if (questionsForFile2 && userAnswerFile2) {
       requestBody.questionsForFile2 = questionsForFile2;
       requestBody.userAnswerFile2 = userAnswerFile2;
-      requestBody.useCase2 = useCase2 || '';
+      requestBody.useCase2 = useCase2 || "";
     }
 
     // Check if we have at least one file's data
     if (!Object.keys(requestBody).length) {
       return res.status(422).json({
-        error: 'Missing data',
-        details: 'Please provide data for at least one file'
+        error: "Missing data",
+        details: "Please provide data for at least one file",
       });
     }
 
-    const response = await axios.post('http://localhost:8002/evaluate-answer', requestBody, {
-      headers: {
-        'Content-Type': 'application/json'
+    const response = await axios.post(
+      "http://localhost:8002/evaluate-answer",
+      requestBody,
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
       }
-    });
+    );
 
     res.json(response.data);
-
   } catch (error) {
-    console.error('Error evaluating answer:', error.response?.data || error.message);
+    console.error(
+      "Error evaluating answer:",
+      error.response?.data || error.message
+    );
     res.status(error.response?.status || 500).json({
-      error: 'Error evaluating answer',
-      details: error.response?.data || error.message
+      error: "Error evaluating answer",
+      details: error.response?.data || error.message,
     });
   }
 });

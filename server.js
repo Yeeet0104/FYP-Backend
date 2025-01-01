@@ -548,8 +548,7 @@ app.post("/check-grammar", async (req, res) => {
         },
       }
     );
-    });
-
+    
 
     console.log("Grammar check feedback:", response.data);
     res.json(response.data);
@@ -980,7 +979,7 @@ function initializeCounters() {
 }
 
 // Call initializeCounters when the server starts
-initializeCounters();
+//initializeCounters();
 
 app.get('/fetch-questions', authenticateToken, (req, res) => {
   const { userId } = req.user;

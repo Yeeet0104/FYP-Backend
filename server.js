@@ -458,7 +458,7 @@ app.get("/fetch-history", authenticateToken, (req, res) => {
   const { conversationId } = req.query; // Fetch conversation_id from query params
 
   let query = `
-    SELECT conversation_id, user_message, bot_response, timestamp ,feedback , grammar_feedback , name
+    SELECT conversation_id, user_message, bot_response, timestamp ,feedback , grammar_feedback , name , job_description , difficulty
     FROM conversation_history
     WHERE user_id = ?
       AND timestamp >= NOW() - INTERVAL 15 DAY
@@ -507,7 +507,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     const lectureText = data.text;
 
 
-    const response = await axios.post('http://localhost:8000/generate-questions', {
+    const response = await axios.post('http://localhost:8003/generate-questions', {
       lecture_text: lectureText,
       bloom_level: bloomLevel,
       question_type: questionType,
